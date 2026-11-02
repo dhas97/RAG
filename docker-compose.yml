@@ -1,0 +1,158 @@
+# Five-service stack: PostgreSQL, Redis, Django, Celery, and React/Nginx.
+#
+# Compose creates a shared network: services connect using their service names.
+# Browser -> frontend -> backend -> PostgreSQL; Celery gets tasks from Redis.
+#
+# ${VARIABLE:-default} reads Compose's interpolation environment (for example,
+# your shell or the project-root .env), using the default if unset or empty.
+# A service's env_file supplies container variables, NOT Compose interpolation.
+# Explicit environment entries override matching entries from env_file.
+#
+# TO START:  docker compose up --build
+# DETACHED:  docker compose up --build -d
+# TO STOP:   docker compose down
+# WARNING: docker compose down -v also deletes the PostgreSQL data volume.
+
+# Each entry below defines one independently managed service.
+services:
+  # Store document metadata, text chunks, and vector embeddings.
+  postgres:
+    # PostgreSQL 16 with the pgvector extension available.
+    image: pgvector/pgvector:pg16
+    # Publish a container port on this computer.
+    ports:
+      # Bind only to localhost: DBeaver uses 5433; PostgreSQL uses 5432 inside Docker.
+      - "127.0.0.1:5433:5432"
+    # These variables initialize a NEW database volume; they do not reset existing users.
+    environment:
+      # Initial database name; defaults to ragdb.
+      POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+      # Initial database administrator role; defaults to raguser.
+      POSTGRES_USER: ${POSTGRES_USER:-raguser}
+      # Initial password. Set POSTGRES_PASSWORD securely instead of relying on this default.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragpassword}
+    # Mount persistent storage into the container.
+    volumes:
+      # Keep database files when the container is replaced or stopped.
+      - postgres_data:/var/lib/postgresql/data
+    # Let dependent services wait until PostgreSQL accepts connections.
+    healthcheck:
+      # CMD-SHELL runs pg_isready through a shell; this checks readiness, not password validity.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-raguser} -d ${POSTGRES_DB:-ragdb}"]
+      # Run the readiness check every five seconds.
+      interval: 5s
+      # Allow each check up to five seconds.
+      timeout: 5s
+      # Mark unhealthy after ten consecutive failures.
+      retries: 10
+
+  # Queue background tasks for Celery; no host port is published.
+  redis:
+    # Use Redis 7 on the lightweight Alpine Linux image.
+    image: redis:7-alpine
+    # Check that the Redis server responds before starting dependent services.
+    healthcheck:
+      # CMD executes directly, without a shell; a healthy Redis responds with PONG.
+      test: ["CMD", "redis-cli", "ping"]
+      # Check every five seconds.
+      interval: 5s
+      # Give each check up to five seconds.
+      timeout: 5s
+      # Mark unhealthy after ten consecutive failures.
+      retries: 10
+
+  # Run the Django API using the backend image's default startup command.
+  backend:
+    # Build an image using backend/Dockerfile and the backend directory as context.
+    build: ./backend
+    # Expose the API directly, in addition to the frontend's /api proxy.
+    ports:
+      # Host port 8000 -> container port 8000, on all host interfaces by default.
+      - "8000:8000"
+    # Load application settings such as the Django secret and Gemini API key.
+    env_file: ./backend/.env
+    # Override env_file values for communication within Docker's network.
+    environment:
+      # Resolve the PostgreSQL service by its Docker DNS name, not localhost.
+      POSTGRES_HOST: postgres
+      # Container-to-container connections use 5432, not the host's DBeaver port 5433.
+      POSTGRES_PORT: "5432"
+      # Match the database name configured for the PostgreSQL service.
+      POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+      # Match the database user configured above.
+      POSTGRES_USER: ${POSTGRES_USER:-raguser}
+      # Overrides POSTGRES_PASSWORD from backend/.env; must match the existing DB role.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragpassword}
+      # Send Celery tasks to Redis service port 6379, logical database 0.
+      CELERY_BROKER_URL: redis://redis:6379/0
+    # Share uploaded files between the host and the API container.
+    volumes:
+      # Bind-mount the host directory into /app/uploads; files survive container replacement.
+      - ./backend/uploads:/app/uploads
+    # Delay startup until these dependencies meet their conditions.
+    depends_on:
+      # PostgreSQL must pass its readiness check.
+      postgres:
+        condition: service_healthy
+      # Redis must pass its ping check.
+      redis:
+        condition: service_healthy
+
+  # Process document ingestion and other queued tasks outside API requests.
+  celery_worker:
+    # Reuse the backend Dockerfile and application code.
+    build: ./backend
+    # Replace the image's default command: run the rag_assistant Celery app,
+    # log at INFO level, and use two worker processes.
+    command: celery -A rag_assistant worker --loglevel=info --concurrency=2
+    # Load the same application secrets and settings as the backend.
+    env_file: ./backend/.env
+    # Use the same Docker database and task broker as the API.
+    environment:
+      # Connect to the PostgreSQL container by service name.
+      POSTGRES_HOST: postgres
+      # Use PostgreSQL's internal port.
+      POSTGRES_PORT: "5432"
+      # Select the same database as the API.
+      POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+      # Authenticate as the same database role.
+      POSTGRES_USER: ${POSTGRES_USER:-raguser}
+      # Override any different password supplied by backend/.env.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragpassword}
+      # Consume tasks from the same Redis queue used by the API.
+      CELERY_BROKER_URL: redis://redis:6379/0
+    # Let the worker read files uploaded through the API.
+    volumes:
+      # Mount the same host uploads directory at the same container path.
+      - ./backend/uploads:/app/uploads
+    # Wait for the worker's database and task broker before starting it.
+    depends_on:
+      # Require PostgreSQL readiness.
+      postgres:
+        condition: service_healthy
+      # Require Redis readiness.
+      redis:
+        condition: service_healthy
+
+  # Build the React app and serve its static files using Nginx.
+  frontend:
+    # Configure the frontend image build.
+    build:
+      # Use frontend/Dockerfile and make frontend files available to the build.
+      context: ./frontend
+      # Supply build-time variables, not runtime container environment variables.
+      args:
+        # Empty means same-origin API requests; Nginx forwards /api to the backend.
+        VITE_API_URL: ""
+    # Publish the web interface on this computer.
+    ports:
+      # Host port 80 -> Nginx port 80; open http://localhost/.
+      - "80:80"
+    # Start the backend container first; this does NOT wait for API readiness.
+    depends_on:
+      - backend
+
+# Declare named storage managed by Docker rather than a host bind mount.
+volumes:
+  # Empty configuration uses the default volume driver; Compose prefixes the name.
+  postgres_data:

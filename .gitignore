@@ -1,0 +1,43 @@
+# Local secrets; keep sanitized environment templates trackable.
+.env
+.env.*
+!.env.example
+
+# Python dependencies and generated files.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Frontend dependencies and builds.
+node_modules/
+dist/
+.vite/
+coverage/
+
+# Uploaded documents, local databases, and logs.
+/backend/uploads/
+*.sqlite3
+*.sqlite3-journal
+*.log
+
+# Personal documents and local command artifacts.
+/resume.html
+/*.pdf
+/online_viewer_net*.txt
+/backend/*psql*
+
+# Editor and operating-system files.
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
